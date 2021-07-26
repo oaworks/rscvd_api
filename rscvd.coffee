@@ -1,235 +1,180 @@
 
-P.svc.rscvd = () ->
-  return 'RSCVD API'
-P.svc.rscvd._index = true
+P.svc.rscvd = _index: true
 
-P.svc.rscvd.retrieve = () ->
-  ak = @apikey #? ''
-  size = @params.size ? '20000'
-  if ak
-    res = await @fetch 'https://api.cottagelabs.com/log?apikey=' + ak + '&sort=createdAt:asc&q=endpoint:collect&size=' + size
-    recs = []
-    for r in res.hits.hits
-      # /api/service/oab/ill/collect/AKfycbwFA_R-0gjzVS9029ByVpduCYJbHLH0ujstNng1aNnRogw1htU?where=InstantILL&doi=10.3109%252F0167482X.2010.503330&atitle=Management%2520of%2520post%2520traumatic%2520stress%2520disorder%2520after%2520childbirth%253A%2520a%2520review&crossref_type=journal-article&aulast=Lapp%252C%2520Leann%2520K.%252C%2520Agbokou%252C%2520Catherine%252C%2520Peretti%252C%2520Charles-Siegfried%252C%2520Ferreri%252C%2520Florian&title=Journal%2520of%2520Psychosomatic%2520Obstetrics%2520%2526%2520Gynecology&issue=3&volume=31&pages=113-122&issn=0167-482X&publisher=Informa%2520UK%2520Limited&year=2010&date=2010-07-01&url=https%253A%252F%252Fdoi.org%252F10.3109%252F0167482X.2010.503330&notes=Subscription%2520check%2520done%2C%2520found%2520nothing.%2520OA%2520availability%2520check%2520done%2C%2520found%2520nothing.&email=mcclay.ill%2540qub.ac.uk&name=Ivona%2520Coghlan&organization=McClay%2520Library%252C%2520Queen%27s%2520University%2520Belfast&reference=IC00226&other=
-      u = r._source.url
-      if typeof u is 'string' and u.startsWith '/api/service/oab/ill/collect/'
-        [sid, params] = u.replace('/api/service/oab/ill/collect/', '').split '?'
-        if typeof sid is 'string' and typeof params is 'string'
-          rec = sid: sid, status: 'Awaiting verification'
-          rec.type = if r._source.sid is 'AKfycbwFA_R-0gjzVS9029ByVpduCYJbHLH0ujstNng1aNnRogw1htU' then 'Paper' else if r._source.sid is 'AKfycbwPq7xWoTLwnqZHv7gJAwtsHRkreJ1hMJVeeplxDG_MipdIamU6' then 'Book' else ''
-          try rec.createdAt = new Date parseInt r._source.createdAt
-          for kv in params.split '&'
-            [key, val] = kv.split '='
-            rec[key] = decodeURIComponent decodeURIComponent val
-            try rec[key] = await @date(rec[key]) if key in ['date', 'needed-by']
-          recs.push rec
-    if recs.length
-      await @svc.rscvd ''
-      @waitUntil @svc.rscvd recs
-    return res.hits.total + ', ' + recs.length
+P.svc.rscvd.form = () ->
+  if @keys(@params).length > 1
+    rec = @copy @params
+    delete rec.form
+    rec.status = 'Awaiting verification'
+    try
+      if rq = await @svc.rscvd.requestees 'email:"' + rec.email + '"'
+        if rq?.verified or rq?.verification is 'Approved'
+          rec.status = 'Verified'
+          rec.verified = true
+        else if rq?.denied or rq?.verification is 'Denied'
+          rec.status = 'Denied'
+          rec.verified = false
+    if rec.status is 'Awaiting verification' # not yet found in pre-verified list
+      try
+        av = await @svc.rscvd 'email:"' + rec.email + '" AND verified:*'
+        if av?.hits?.hits and av.hits.hits[0]._source.verified is true
+          rec.status = 'Verified'
+          rec.verified = true
+        else if av.hits.hits[0]._source.verified is false
+          rec.status = 'Denied'
+          rec.verified = false
+    rec.type ?= 'paper'
+    try rec.createdAt = new Date()
+    try rec.neededAt = await @epoch rec['needed-by']
+    rec._id = await @svc.rscvd rec
+    try
+      txt = 'Hi ' + rec.name + ',<br><br>We got your request:<br><br>Title: ' + (rec.atitle ? rec.title ? 'Unknown') + '\nReference (if provided): ' + (rec.reference ? '') + '<br><br>'
+      txt += 'If at any point you no longer need this item, please <a href="https://' + (if @S.dev then 'dev.' else '') + 'rscvd.org/cancel?id=' + rec._id + '">cancel your request</a>, it only takes a second.<br><br>'
+      txt += 'Our team of volunteers will try and fill your request as soon as possible. If you would like to thank us, please consider <a href="https://rscvd.org/volunteer">joining us in helping supply requests</a>.<br><br>'
+      txt += 'Yours,<br><br>RSCVD team'
+      @mail
+        from: 'rscvd@oa.works'
+        to: rec.email
+        subject: 'RSCVD Request Receipt'
+        text: txt
+    return rec
+  else
+    return undefined
 
+P.svc.rscvd.requestees = 
+  _index: true
+  _hide: true
+  _auth: true
+  _prefix: false
+  _sheet: '1GuIH-Onf0A0dXFokH6Ma0cS0TRbbpAeOyhDVpmDNDNw'
+
+P.svc.rscvd.resolves = (rid, resolver) ->
+  rid ?= @params.resolves
+  resolver ?= @params.resolver
+  if rid
+    rec = if typeof rid is 'object' then rid else await @svc.rscvd rid # can pass the ID of a specific record to resolve
+  else
+    recs = await @svc.rscvd '(status:"Awaiting verification" OR status:"Verified" OR status:"In progress" OR status:"Awaiting Peter") AND NOT resolved:"' + resolver + '" AND NOT unresolved:"' + resolver + '"'
+  res = {}
+  for r in (if rec? then [rec] else (recs?.hits?.hits ? []))
+    if r._source?
+      rec = r._source
+      rec._id ?= r._id
+    meta = @copy rec
+    meta.journal = meta.title if meta.title
+    meta.title = meta.atitle if meta.atitle
+    resolves = await @svc.oaworks.ill.subscription {subscription: resolver}, meta # should send the metadata in the record
+    if resolves?.url # if resolves
+      rec.resolved ?= []
+      rec.resolved.push resolver
+      rec.resolves ?= []
+      rec.resolves.push {resolver: resolver, url: resolves.url, user: @user?._id}
+      res[r._id] = true
+    else # does not resolve
+      rec.unresolved ?= []
+      rec.unresolved.push resolver
+      res[r._id] = false
+    @svc.rscvd rec
+  return if rid and res[rid] then res[rid] else res
+
+P.svc.rscvd.cancel = () ->
+  return undefined if not @params.cancel
+  rec = await @svc.rscvd @params.cancel
+  rec.status = 'Cancelled'
+  @svc.rscvd rec
+  return rec
 
 P.svc.rscvd.verify = (email, verify=true) ->
   email ?= @params.verify
   return undefined if not email
-  await @index._each 'svc_rscvd', 'email:"' + email + '"', {action: 'index'}, (rec) ->
-    rec.verified = verify
+  re = await @svc.rscvd 'email:"' + email + '"'
+  re ?= email: email, createdAt: Date.now()
+  if verify
+    re.verified = true
+    re.verified_by = @user.email
+  else
+    re.denied = true
+    re.denied_by = @user.email
+  @waitUntil @svc.rscvd.requestees re
+  await @svc.rscvd._each 'email:"' + email + '"', {action: 'index'}, (rec) ->
     if not rec.status or rec.status is 'Awaiting verification'
-      rec.status = if verify then 'Verified' else 'Denied'
+      rec.verified = verify
+      if verify
+        rec.status = 'Verified'
+        rec.verified_by = @user.email
+      else
+        rec.status = 'Denied'
+        rec.denied_by = @user.email
     return rec
   return true
+P.svc.rscvd.verify._auth = true
 P.svc.rscvd.deny = () ->
   return @svc.rscvd.verify @params.deny, false
+P.svc.rscvd.deny._auth = true
 
 P.svc.rscvd.status = () ->
   return undefined if not @params.status
   [rid, status] = @params.status.split '/'
   rec = await @svc.rscvd rid
   rec.status = status
+  try
+    if rec.status is 'Done'
+      rec.done_by = @user.email
+    else if rec.status is 'In Progress'
+      rec.progressed_by = @user.email
   @svc.rscvd rec
   return rec
+P.svc.rscvd.status._auth = true
 
-P.svc.rscvd.supply = () ->
-  body = '<script>pradm.next = true;</script>\n<div class="container lg">
-<div class="flex sticky cream" style="border-bottom: 1px solid #ccc; padding-top:10px;">
-  <div class="c6">
-    <div>
-      <p><b>RSCVD Supply</b>. show <label>
-        <input type="radio" name="types" class="types" value="AKfycbwPq7xWoTLwnqZHv7gJAwtsHRkreJ1hMJVeeplxDG_MipdIamU6">
-        <span class="checkable">books</span>
-      </label>
-      or
-      <label>
-        <input type="radio" name="types" class="types" value="AKfycbwFA_R-0gjzVS9029ByVpduCYJbHLH0ujstNng1aNnRogw1htU">
-        <span class="checkable">papers</span>
-      </label></p>
-      <p><select><option value="">filter by...</option></select></p>
-    </div>
-  </div>
-  <div class="c6">
-    <a id="account" class="button right" href="#">Account</a>
-    <a class="button right transparent" target="_blank" href="https://rscvd.org/supply">Instructions</a>
-  </div>
-  <div class="c6 off6 bordered" id="details" style="display: none;">
-    <p id="username"></p>
-    <p><a id="logout" href="#">Logout</a></p>
-  </div>
-</div>'
+P.svc.rscvd.poll = (poll, which) ->
+  @nolog = true
+  poll ?= @params.poll ? (Date.now() - 180000) # default to changes in last 3 mins
+  which = @params.which ? ['new', 'verify', 'deny', 'cancel', 'status', 'overdue']
+  which = which.split(',') if typeof which is 'string'
+  @svc.rscvd.overdue() if 'overdue' in which
+  res = new: [], verify: [], deny: [], cancel: [], status: {}
+  if 'new' in which
+    nn = await @svc.rscvd '(status:"Awaiting verification" OR status:"Verified") AND createdAt:>' + poll, 500
+    for n in nn?.hits?.hits ? []
+      n._source._id ?= n._id
+      res.new.push n._source
+  if 'verify' in which
+    vs = await @index 'logs', 'createdAt:>' + poll + ' AND fn:"svc.rscvd.verify"', {sort: {createdAt: 'desc'}, size: 500}
+    for v in vs.hits.hits
+      vn = v._source.parts.pop()
+      res.verify.push(vn) if vn not in res.verify
+  if 'deny' in which
+    ds = await @index 'logs', 'createdAt:>' + poll + ' AND fn:"svc.rscvd.deny"', {sort: {createdAt: 'desc'}, size: 500}
+    for d in ds.hits.hits
+      dn = d._source.parts.pop()
+      res.deny.push(dn) if dn not in res.deny
+  if 'cancel' in which
+    cc = await @index 'logs', 'createdAt:>' + poll + ' AND fn:"svc.rscvd.cancel"', {sort: {createdAt: 'desc'}, size: 500}
+    for c in cc.hits.hits
+      cn = c._source.parts.pop()
+      res.cancel.push(cn) if cn not in res.cancel
+  # TODO need to track changes to Overdue status as well
+  if 'status' in which
+    ss = await @index 'logs', 'createdAt:>' + poll + ' AND fn:"svc.rscvd.status"', {sort: {createdAt: 'desc'}, size: 500}
+    for s in ss.hits.hits
+      st = s._source.parts.pop()
+      res.status[s._source.parts.pop()] ?= st # only return the most recent status change for a given record ID
+  return res
 
-  opts = {sort: {createdAt: 'desc'}, terms: ['email', 'status']}
-  size = 500
-  opts.size = size if not @params.size
-  qr = await @index.translate (if JSON.stringify(@params) isnt '{}' then @params else 'email:* AND (title:* OR atitle:*)'), opts
-  res = await @svc.rscvd qr
+P.svc.rscvd.overdue = () ->
+  counter = 0
+  dn = Date.now()
+  recs = []
+  if @params.overdue
+    recs.push await @svc.rscvd @params.overdue
+  else
+    res = await @svc.rscvd '(status:"Awaiting verification" OR status:"Verified") AND (neededAt:<' + dn + ' OR createdAt:<' + (dn - 1209600000) + ')', 10000
+    for r in res.hits.hits
+      r._source._id ?= r._id
+      recs.push r._source
+  for rec in recs
+    rec.status = 'Overdue'
+    @svc.rscvd rec
+    counter += 1
+  return counter
 
-  status_filter = '<select class="filter" id="status"><option value="">' + (if @params.q and @params.q.includes('status:') then 'clear status filter' else 'Filter by status') + '</option>'
-  for st in res.aggregations.status.buckets
-    if st.key
-      status_filter += '<option value="' + st.key + '"' + (if @params.q and @params.q.includes(st.key) then ' selected="selected"' else '') + '>' + st.key + ' (' + st.doc_count + ')' + '</option>'
-  status_filter += '</select>'
-
-  email_filter = '<select class="filter" id="email"><option value="">' + (if @params.q and @params.q.includes('email:') then 'clear requestee filter' else 'Filter by requestee') + '</option>'
-  for st in res.aggregations.email.buckets
-    if st.key
-      email_filter += '<option value="' + st.key + '"' + (if @params.q and @params.q.includes(st.key) then ' selected="selected"' else '') + '>' + st.key + ' (' + st.doc_count + ')' + '</option>'
-  email_filter += '</select>'
-
-  body += '<table class="paradigm">\n'
-  body += '<thead><tr>'
-
-  headers = ['Item', 'Request']
-  for h in headers
-    body += '<th>'
-    if h is 'Item'
-      pager = if qr.from then '<a class="pager ' + (qr.from - (qr.size ? size)) + '" href="#">&lt; back</a> items ' else 'Items '
-      if res.hits.total > res.hits.hits.length
-        pager += (qr.from ? 1) + ' to ' + ((qr.from ? 0) + (qr.size ? size))
-        pager += '. <a class="pager ' + ((qr.from ? 0) + (qr.size ? size)) + '" href="#">next &gt;</a>'
-      body += pager
-    else
-      body += h
-      body += '<br>' + email_filter if h is 'Requestee'
-      body += '<br>' + status_filter if h is 'Status'
-    body += '</th>'
-  body += '</tr></thead>'
-  body += '<tbody>'
-
-  columns = ['title', 'email'] #, 'publisher', 'year', 'doi', 'issn', 'isbn']
-  for r in res.hits.hits
-    for k of r._source
-      if typeof r._source[k] is 'string' and r._source[k].includes '%'
-        try r._source[k] = decodeURIComponent r._source[k]
-    body += '\n<tr>'
-    for c in columns
-      val = r._source[c] ? ''
-      if c is 'title'
-        val = (if r._source.doi and r._source.doi.startsWith('10.') then '<a target="_blank" href="https://doi.org/' + r._source.doi + '">' else '') + '<b>' + (r._source.atitle ? r._source.title) + '</b>' + (if r._source.doi and r._source.doi.startsWith('10.') then '</a>' else '')
-        if r._source.year or r._source.publisher or (r._source.title and r._source.atitle)
-          val += '<br>' + (if r._source.year then r._source.year + ' ' else '') + (if r._source.title and r._source.atitle then '<i><a class="title" href="#">' + r._source.title + '</a></i>' + (if r._source.publisher then ', ' else '') else '') + (r._source.publisher ? '')
-        if r._source.volume or r._source.issue or r._source.pages
-          val += '<br>' + (if r._source.volume then 'vol: ' + r._source.volume + ' ' else '') + (if r._source.issue then 'issue: ' + r._source.issue + ' ' else '') + (if r._source.pages then 'page(s): ' + r._source.pages else '')
-        if r._source.doi or r._source.issn or r._source.isbn
-          val += '<br>' + (if r._source.doi and r._source.doi.startsWith('10.') then '<a target="_blank" href="https://doi.org/' + r._source.doi + '">' + r._source.doi + '</a> ' else '') + (if r._source.issn then ' ISSN ' + r._source.issn else '') + (if r._source.isbn then ' ISBN ' + r._source.isbn else '')
-      else if c is 'email'
-        if r._source.verified?
-          if r._source.verified
-            val = '<a href="mailto:' + r._source.email + '">' + r._source.email + '</a>'
-            if r._source['needed-by']
-              val += '<br>Required by ' + r._source['needed-by'].split('-').reverse().join('/')
-              val += '<br>Ref: ' + r._source.reference if r._source.reference
-              #val += '<br>Other: ' + r._source.other if r._source.other # don't show other
-          else
-            val = '<span style="color: red;">' + r._source.email + '</span>'
-        else
-          val = (r._source.name ? r._source.email) + (if r._source.organization then (if r._source.name then ', ' else '') + r._source.organization else '')
-        if r._source.verified?
-          if r._source.verified
-            # Verified and Denied are also possible, but won't be shown
-            # Cancelled will later be set by a user on some page where they cancel their request. Doesn't need to ahve function here, just show as info.
-            # if passed required by date, or 14 days since created, set to Overdue
-            val += '<br><select class="action status ' + r._id + '">'
-            sopts = ['In progress', 'Awaiting Peter', 'Provided', 'Done']
-            val += '<option value="">Set a status...</option>' if not r._source.status or r._source.status not in sopts
-            for st in sopts
-              val += '<option' + (if r._source.status is st then ' selected="selected"' else '') + '>' + st + '</option>'
-            val += '</select>'
-          else
-            val += '<br>Request denied'
-        else
-          nn = if r._source.name then r._source.name.split(' ')[0] else r._source.email.split('@')[0]
-          val += '<br><a class="button action verify ' + r._source.email + '" href="#">Verify ' + nn + '</a> <a class="button warning verify deny ' + r._source.email + '" href="#">Deny ' + nn + '</a>'
-      body += '<td>' + val + '</td>'
-    body += '</tr>'
-  body += '\n</tbody></table>\n'
-  body += '''</div>\n<script>
-  pradm.listen("click", ".verify", function(e) {
-    e.preventDefault();
-    var el = e.target;
-    var cls = pradm.classes(el);
-    cls.pop();
-    pradm.html(el, (cls.indexOf("deny") !== -1 ? "Deny" : "Verify") + 'ing...');
-    var url = "/svc/rscvd/" + (cls.indexOf("deny") !== -1 ? "deny" : "verify") + "/" + cls.pop();
-    pradm.ajax(url);
-    setTimeout(function() { location.reload(); }, 3000);
-  });
-  pradm.listen("change", ".status", function(e) {
-    var el = e.target;
-    var cls = pradm.classes(el);
-    cls.pop();
-    var url = "/svc/rscvd/status/" + cls.pop() + "/" + el.value;
-    pradm.html(el, 'Updating...');
-    pradm.ajax(url);
-    setTimeout(function() { location.reload(); }, 3000);
-  });
-  pradm.listen("change", ".filter", function(e) {
-    var status = pradm.get('#status');
-    var email = pradm.get('#email');
-    var q = '';
-    if (status) q += 'status:"' + status + '"';
-    if (email) {
-      if (q.length) q += ' AND ';
-      q += 'email:"' + email + '"';
-    }
-    window.history.pushState("", "", window.location.pathname + (q !== '' ? "?q=" + q : ''));
-    location.reload();
-  });
-  pradm.listen("click", ".pager", function(e) {
-    e.preventDefault();
-    var el = e.target;
-    var cls = pradm.classes(el);
-    cls.pop();
-    window.history.pushState("", "", window.location.pathname + "?from=" + cls.pop());
-    location.reload();
-  });
-  pradm.listen("click", ".title", function(e) {
-    e.preventDefault();
-    var el = e.target;
-    window.history.pushState("", "", window.location.pathname + '?q=title:"' + el.innerHTML + '"');
-    location.reload();
-  });
-  pradm.listen("click", ".types", function(e) {
-    e.preventDefault();
-    var type = pradm.get(e.target);
-    window.history.pushState("", "", window.location.pathname + '?q=sid:"' + type + '"');
-    location.reload();
-  });
-  try {
-    var name = pradm.loggedin().email.split('@')[0];
-    name = name.substring(0,1).toUpperCase() + name.substring(1);
-    pradm.html('#username', name);
-    pradm.listen("click", "#logout", function(e) {
-      e.preventDefault();
-      pradm.next = true;
-      pradm.logout();
-    });
-    pradm.listen("click", "#account", function(e) {
-      e.preventDefault();
-      pradm.toggle('#details');
-    });
-  } catch (err) {}
-</script>'''
-
-  @format = 'html'
-  return body
-
-P.svc.rscvd.supply._auth = true
