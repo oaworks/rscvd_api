@@ -87,7 +87,9 @@ P.svc.rscvd.cancel = () ->
 P.svc.rscvd.verify = (email, verify=true) ->
   email ?= @params.verify
   return undefined if not email
-  re = await @svc.rscvd 'email:"' + email + '"'
+  re = await @svc.rscvd.requestees 'email:"' + email + '"'
+  re = re.hits.hits[0]._source if re?.hits?.total is 1
+  re = undefined if re?.hits?
   re ?= email: email, createdAt: Date.now()
   if verify
     re.verified = true
