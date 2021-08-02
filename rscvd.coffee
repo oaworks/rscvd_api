@@ -174,7 +174,7 @@ P.svc.rscvd.overdue = () ->
       recs.push r._source
   for rec in recs
     rec.status = 'Overdue'
-    @svc.rscvd rec
+    @waitUntil @svc.rscvd rec
     counter += 1
   return counter
 
